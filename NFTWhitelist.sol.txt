@@ -1,0 +1,145 @@
+NFTWhitelist.sol
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title NFTWhitelist
+ * @notice Merkle-proof based whitelist for NFT mints.
+ *         Root is set by owner. Users prove inclusion without
+ *         storing every address on-chain.
+ */
+contract NFTWhitelist {
+
+    // ─── Storage ──────────────────────────────────────────────────
+    address public immutable owner;
+    bytes32 public merkleRoot;
+    uint256 public mintPrice;
+    uint256 public maxPerWallet;
+    uint256 public totalMinted;
+    uint256 public supplyLimit;
+    bool    public mintOpen;
+
+    mapping(address => uint256) public minted;
+    mapping(address => bool)    public claimed; // one-time claim guard
+
+    // ─── Events ───────────────────────────────────────────────────
+    event RootUpdated  (bytes32 newRoot);
+    event MintToggled  (bool open);
+    event Minted       (address indexed user, uint256 amount);
+    event Withdrawn    (uint256 amount);
+
+    // ─── Modifiers ────────────────────────────────────────────────
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Unauthorized");
+        _;
+    }
+
+    // ─── Constructor ──────────────────────────────────────────────
+    constructor(
+        bytes32 _merkleRoot,
+        uint256 _mintPrice,
+        uint256 _maxPerWallet,
+        uint256 _supplyLimit
+    ) {
+        require(_maxPerWallet > 0, "Max per wallet must be > 0");
+        require(_supplyLimit  > 0, "Supply limit must be > 0");
+
+        owner         = msg.sender;
+        merkleRoot    = _merkleRoot;
+        mintPrice     = _mintPrice;
+        maxPerWallet  = _maxPerWallet;
+        supplyLimit   = _supplyLimit;
+    }
+
+    // ─── Admin ────────────────────────────────────────────────────
+
+    function setMerkleRoot(bytes32 newRoot) external onlyOwner {
+        merkleRoot = newRoot;
+        emit RootUpdated(newRoot);
+    }
+
+    function setMintOpen(bool open) external onlyOwner {
+        mintOpen = open;
+        emit MintToggled(open);
+    }
+
+    function setMintPrice(uint256 newPrice) external onlyOwner {
+        mintPrice = newPrice;
+    }
+
+    // ─── Core functions ───────────────────────────────────────────
+
+    /**
+     * @notice Mint tokens using a Merkle proof.
+     * @param amount Amount to mint in this transaction
+     * @param proof  Merkle proof verifying msg.sender is whitelisted
+     */
+    function mint(uint256 amount, bytes32[] calldata proof)
+        external
+        payable
+    {
+        require(mintOpen,                                "Mint is not open");
+        require(amount > 0,                             "Amount must be > 0");
+        require(totalMinted + amount <= supplyLimit,    "Supply exceeded");
+        require(minted[msg.sender] + amount <= maxPerWallet, "Wallet limit exceeded");
+        require(msg.value == mintPrice * amount,        "Wrong ETH amount");
+        require(_verify(proof, msg.sender),             "Not whitelisted");
+
+        minted[msg.sender] += amount;
+        totalMinted        += amount;
+
+        emit Minted(msg.sender, amount);
+
+        // NOTE: actual NFT mint logic plugs in here via inheritance
+        // _safeMint(msg.sender, tokenId) in your ERC-721 contract
+    }
+
+    function withdraw() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "Nothing to withdraw");
+
+        emit Withdrawn(balance);
+
+        (bool ok, ) = payable(owner).call{value: balance}("");
+        require(ok, "Withdrawal failed");
+    }
+
+    // ─── Internal ─────────────────────────────────────────────────
+
+    function _verify(bytes32[] memory proof, address addr)
+        internal
+        view
+        returns (bool)
+    {
+        bytes32 leaf = keccak256(abi.encodePacked(addr));
+        return _processProof(proof, leaf) == merkleRoot;
+    }
+
+    function _processProof(bytes32[] memory proof, bytes32 leaf)
+        internal
+        pure
+        returns (bytes32 computed)
+    {
+        computed = leaf;
+        for (uint256 i = 0; i < proof.length; i++) {
+            bytes32 node = proof[i];
+            computed = computed <= node
+                ? keccak256(abi.encodePacked(computed, node))
+                : keccak256(abi.encodePacked(node, computed));
+        }
+    }
+
+    // ─── View ─────────────────────────────────────────────────────
+
+    function remainingSupply() external view returns (uint256) {
+        return supplyLimit - totalMinted;
+    }
+
+    function walletRemaining(address user) external view returns (uint256) {
+        return maxPerWallet - minted[user];
+    }
+
+    receive() external payable { revert("Use mint()"); }
+}

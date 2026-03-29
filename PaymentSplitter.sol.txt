@@ -1,0 +1,161 @@
+PaymentSplitter.sol
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title PaymentSplitter
+ * @notice ETH sent to this contract is automatically split among
+ *         registered payees according to their share weights.
+ *         Each payee pulls their own balance (pull-payment pattern).
+ */
+contract PaymentSplitter {
+
+    // ─── Constants ────────────────────────────────────────────────
+    uint256 public constant MAX_PAYEES    = 20;
+    uint256 public constant TOTAL_SHARES  = 10_000; // basis points
+
+    // ─── State types ──────────────────────────────────────────────
+    struct Payee {
+        address wallet;
+        uint256 shares;  // out of 10_000
+        uint256 released;
+    }
+
+    // ─── Storage ──────────────────────────────────────────────────
+    address public immutable admin;
+    uint256 public payeeCount;
+    uint256 public totalReceived;
+
+    mapping(uint256 => Payee)   public payees;
+    mapping(address => uint256) public payeeIndex; // 1-indexed to detect non-membership
+    mapping(address => bool)    public isPayee;
+
+    // ─── Events ───────────────────────────────────────────────────
+    event PaymentReceived(address indexed sender, uint256 amount);
+    event PayeeAdded     (address indexed wallet, uint256 shares);
+    event PayeeUpdated   (address indexed wallet, uint256 newShares);
+    event Released       (address indexed wallet, uint256 amount);
+
+    // ─── Modifiers ────────────────────────────────────────────────
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Unauthorized");
+        _;
+    }
+
+    // ─── Constructor ──────────────────────────────────────────────
+    /**
+     * @param wallets  Array of payee addresses
+     * @param shares   Corresponding shares (must sum to 10_000)
+     */
+    constructor(address[] memory wallets, uint256[] memory shares) {
+        require(wallets.length == shares.length, "Length mismatch");
+        require(wallets.length > 0,              "No payees");
+        require(wallets.length <= MAX_PAYEES,    "Too many payees");
+
+        admin = msg.sender;
+
+        uint256 total;
+        for (uint256 i = 0; i < wallets.length; i++) {
+            address w = wallets[i];
+            uint256 s = shares[i];
+
+            require(w != address(0), "Zero address");
+            require(!isPayee[w],     "Duplicate payee");
+            require(s > 0,           "Share must be > 0");
+
+            payeeIndex[w]      = i + 1;
+            isPayee[w]         = true;
+            payees[i]          = Payee({ wallet: w, shares: s, released: 0 });
+            payeeCount++;
+            total += s;
+
+            emit PayeeAdded(w, s);
+        }
+
+        require(total == TOTAL_SHARES, "Shares must sum to 10000");
+    }
+
+    // ─── Core functions ───────────────────────────────────────────
+
+    /**
+     * @notice Any payee can pull their pending balance at any time.
+     */
+    function release() external {
+        require(isPayee[msg.sender], "Not a payee");
+
+        uint256 idx   = payeeIndex[msg.sender] - 1;
+        Payee storage p = payees[idx];
+
+        uint256 due = (totalReceived * p.shares) / TOTAL_SHARES;
+        uint256 pending = due - p.released;
+
+        require(pending > 0, "Nothing to release");
+
+        p.released += pending;
+
+        emit Released(msg.sender, pending);
+
+        (bool ok, ) = payable(msg.sender).call{value: pending}("");
+        require(ok, "Release failed");
+    }
+
+    /**
+     * @notice Admin can update a payee's share.
+     *         All shares must still sum to 10_000 after the change.
+     * @param wallet      Payee to update
+     * @param newShares   New share value in basis points
+     * @param otherIndex  Another payee index to offset the difference
+     */
+    function updateShare(
+        address wallet,
+        uint256 newShares,
+        uint256 otherIndex
+    ) external onlyAdmin {
+        require(isPayee[wallet],          "Not a payee");
+        require(otherIndex < payeeCount,  "Invalid index");
+        require(newShares > 0,            "Share must be > 0");
+
+        uint256 idx     = payeeIndex[wallet] - 1;
+        Payee storage p = payees[idx];
+        Payee storage q = payees[otherIndex];
+
+        require(q.wallet != wallet, "Cannot offset against self");
+
+        int256 delta = int256(newShares) - int256(p.shares);
+        int256 newQ  = int256(q.shares) - delta;
+
+        require(newQ > 0, "Offset payee share would be zero or negative");
+
+        p.shares = newShares;
+        q.shares = uint256(newQ);
+
+        emit PayeeUpdated(wallet,   newShares);
+        emit PayeeUpdated(q.wallet, uint256(newQ));
+    }
+
+    // ─── View ─────────────────────────────────────────────────────
+
+    /// @notice How much ETH a payee can withdraw right now.
+    function pendingRelease(address wallet) external view returns (uint256) {
+        if (!isPayee[wallet]) return 0;
+        uint256 idx = payeeIndex[wallet] - 1;
+        Payee memory p = payees[idx];
+        uint256 due = (totalReceived * p.shares) / TOTAL_SHARES;
+        return due > p.released ? due - p.released : 0;
+    }
+
+    function getPayees() external view returns (Payee[] memory result) {
+        result = new Payee[](payeeCount);
+        for (uint256 i = 0; i < payeeCount; i++) {
+            result[i] = payees[i];
+        }
+    }
+
+    // ─── Receive ──────────────────────────────────────────────────
+    receive() external payable {
+        require(msg.value > 0, "Zero value");
+        totalReceived += msg.value;
+        emit PaymentReceived(msg.sender, msg.value);
+    }
+}

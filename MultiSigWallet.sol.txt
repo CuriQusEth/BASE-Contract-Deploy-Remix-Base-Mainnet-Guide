@@ -1,0 +1,227 @@
+MultiSigWallet.sol
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title MultiSigWallet
+ * @notice M-of-N multisig. Any owner proposes a transaction,
+ *         required number of owners must confirm before execution.
+ */
+contract MultiSigWallet {
+
+    // ─── Constants ────────────────────────────────────────────────
+    uint256 public constant MAX_OWNERS = 10;
+
+    // ─── State types ──────────────────────────────────────────────
+    struct Transaction {
+        address to;
+        uint256 value;
+        bytes   data;
+        bool    executed;
+        uint256 confirmCount;
+    }
+
+    // ─── Storage ──────────────────────────────────────────────────
+    address[] public owners;
+    uint256   public required;
+    uint256   public txCount;
+
+    mapping(address => bool)                     public isOwner;
+    mapping(uint256 => Transaction)              public transactions;
+    mapping(uint256 => mapping(address => bool)) public confirmed;
+
+    // ─── Events ───────────────────────────────────────────────────
+    event Deposit       (address indexed sender, uint256 amount);
+    event TxProposed    (uint256 indexed txId, address indexed to, uint256 value);
+    event TxConfirmed   (uint256 indexed txId, address indexed owner);
+    event TxRevoked     (uint256 indexed txId, address indexed owner);
+    event TxExecuted    (uint256 indexed txId);
+    event OwnerAdded    (address indexed owner);
+    event OwnerRemoved  (address indexed owner);
+    event RequirementChanged(uint256 newRequired);
+
+    // ─── Modifiers ────────────────────────────────────────────────
+    modifier onlyOwner() {
+        require(isOwner[msg.sender], "Not an owner");
+        _;
+    }
+
+    modifier onlySelf() {
+        require(msg.sender == address(this), "Only via multisig");
+        _;
+    }
+
+    modifier txExists(uint256 txId) {
+        require(txId < txCount, "Tx does not exist");
+        _;
+    }
+
+    modifier notExecuted(uint256 txId) {
+        require(!transactions[txId].executed, "Already executed");
+        _;
+    }
+
+    // ─── Constructor ──────────────────────────────────────────────
+    constructor(address[] memory _owners, uint256 _required) {
+        require(_owners.length >= 2,              "At least 2 owners");
+        require(_owners.length <= MAX_OWNERS,     "Too many owners");
+        require(_required >= 1,                   "Required must be >= 1");
+        require(_required <= _owners.length,      "Required exceeds owner count");
+
+        for (uint256 i = 0; i < _owners.length; i++) {
+            address o = _owners[i];
+            require(o != address(0),  "Zero address");
+            require(!isOwner[o],      "Duplicate owner");
+            isOwner[o] = true;
+            owners.push(o);
+            emit OwnerAdded(o);
+        }
+
+        required = _required;
+    }
+
+    // ─── Core functions ───────────────────────────────────────────
+
+    /**
+     * @notice Propose a new transaction for confirmation.
+     * @param to    Destination address
+     * @param value ETH to send (can be 0 for contract calls)
+     * @param data  Calldata (empty for plain ETH sends)
+     */
+    function propose(
+        address to,
+        uint256 value,
+        bytes calldata data
+    ) external onlyOwner returns (uint256 txId) {
+        require(to != address(0), "Zero address");
+
+        txId = txCount++;
+
+        transactions[txId] = Transaction({
+            to:           to,
+            value:        value,
+            data:         data,
+            executed:     false,
+            confirmCount: 0
+        });
+
+        emit TxProposed(txId, to, value);
+    }
+
+    /**
+     * @notice Confirm a pending transaction.
+     *         Automatically executes when threshold is reached.
+     */
+    function confirm(uint256 txId)
+        external
+        onlyOwner
+        txExists(txId)
+        notExecuted(txId)
+    {
+        require(!confirmed[txId][msg.sender], "Already confirmed");
+
+        confirmed[txId][msg.sender] = true;
+        transactions[txId].confirmCount++;
+
+        emit TxConfirmed(txId, msg.sender);
+
+        if (transactions[txId].confirmCount >= required) {
+            _execute(txId);
+        }
+    }
+
+    /**
+     * @notice Revoke a previously given confirmation.
+     */
+    function revoke(uint256 txId)
+        external
+        onlyOwner
+        txExists(txId)
+        notExecuted(txId)
+    {
+        require(confirmed[txId][msg.sender], "Not confirmed by you");
+
+        confirmed[txId][msg.sender] = false;
+        transactions[txId].confirmCount--;
+
+        emit TxRevoked(txId, msg.sender);
+    }
+
+    // ─── Admin (only callable via multisig itself) ─────────────────
+
+    function addOwner(address newOwner) external onlySelf {
+        require(newOwner != address(0), "Zero address");
+        require(!isOwner[newOwner],     "Already an owner");
+        require(owners.length < MAX_OWNERS, "Max owners reached");
+
+        isOwner[newOwner] = true;
+        owners.push(newOwner);
+        emit OwnerAdded(newOwner);
+    }
+
+    function removeOwner(address target) external onlySelf {
+        require(isOwner[target],          "Not an owner");
+        require(owners.length - 1 >= required, "Would break quorum");
+
+        isOwner[target] = false;
+
+        for (uint256 i = 0; i < owners.length; i++) {
+            if (owners[i] == target) {
+                owners[i] = owners[owners.length - 1];
+                owners.pop();
+                break;
+            }
+        }
+
+        emit OwnerRemoved(target);
+    }
+
+    function changeRequirement(uint256 newRequired) external onlySelf {
+        require(newRequired >= 1,            "Required must be >= 1");
+        require(newRequired <= owners.length,"Exceeds owner count");
+        required = newRequired;
+        emit RequirementChanged(newRequired);
+    }
+
+    // ─── Internal ─────────────────────────────────────────────────
+
+    function _execute(uint256 txId) internal {
+        Transaction storage t = transactions[txId];
+        t.executed = true;
+
+        (bool ok, ) = t.to.call{value: t.value}(t.data);
+        require(ok, "Execution failed");
+
+        emit TxExecuted(txId);
+    }
+
+    // ─── View ─────────────────────────────────────────────────────
+
+    function getOwners() external view returns (address[] memory) {
+        return owners;
+    }
+
+    function getConfirmations(uint256 txId)
+        external
+        view
+        returns (address[] memory confirmedBy)
+    {
+        uint256 count;
+        for (uint256 i = 0; i < owners.length; i++) {
+            if (confirmed[txId][owners[i]]) count++;
+        }
+
+        confirmedBy = new address[](count);
+        uint256 idx;
+        for (uint256 i = 0; i < owners.length; i++) {
+            if (confirmed[txId][owners[i]]) {
+                confirmedBy[idx++] = owners[i];
+            }
+        }
+    }
+
+    receive() external payable {
+        emit Deposit(msg.sender, msg.value);
+    }
+}
